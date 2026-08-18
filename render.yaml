@@ -1,0 +1,17 @@
+# Render.com blueprint — deploys the EDIO AI server automatically.
+# In Render you can also just create a "Web Service" from your repo and use the
+# start command below; this file makes it one-click if you use "Blueprint".
+services:
+  - type: web
+    name: edio-ai
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn server:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false          # set this secretly in the Render dashboard
+      - key: GEMINI_MODEL
+        value: gemini-1.5-flash
+      - key: EDIO_APP_TOKEN
+        sync: false          # optional shared token; set in dashboard
