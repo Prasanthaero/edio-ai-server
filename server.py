@@ -101,8 +101,15 @@ def call_gemini(uart_log):
     if not GEMINI_API_KEY:
         return "error", {"error": "SERVER_NO_KEY",
                          "message": "AI key not configured on the server."}
+    # Send the key in the x-goog-api-key HEADER (not in the URL). The URL
+    # ?key= form only works with the old AIzaSy keys; the new AQ. auth keys
+    # must be sent as a header, so this works for BOTH old and new keys.
     url = ("https://generativelanguage.googleapis.com/v1beta/models/"
-           f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}")
+           f"{GEMINI_MODEL}:generateContent")
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY,
+    }
     payload = {
         "system_instruction": {"parts": [{"text": GEMINI_SYSTEM}]},
         "contents": [{"role": "user",
@@ -111,7 +118,7 @@ def call_gemini(uart_log):
                              "temperature": 0.2},
     }
     try:
-        r = requests.post(url, json=payload, timeout=60)
+        r = requests.post(url, headers=headers, json=payload, timeout=60)
         if r.status_code != 200:
             return "error", {"error": "AI_HTTP_%d" % r.status_code,
                              "message": r.text[:300]}
