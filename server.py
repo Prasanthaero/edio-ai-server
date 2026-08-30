@@ -97,40 +97,30 @@ GEMINI_SYSTEM = (
 
 
 def call_gemini(uart_log):
-    """Call Gemini and return (status, result_dict)."""
+    """Call Gemini using the OFFICIAL google-generativeai SDK. The SDK handles
+    the new AQ. auth keys correctly (the raw REST endpoint can time out / reject
+    them). Returns (status, result_dict)."""
     if not GEMINI_API_KEY:
         return "error", {"error": "SERVER_NO_KEY",
                          "message": "AI key not configured on the server."}
-    # Send the key in the x-goog-api-key HEADER (not in the URL). The URL
-    # ?key= form only works with the old AIzaSy keys; the new AQ. auth keys
-    # must be sent as a header, so this works for BOTH old and new keys.
-    url = ("https://generativelanguage.googleapis.com/v1beta/models/"
-           f"{GEMINI_MODEL}:generateContent")
-    headers = {
-        "Content-Type": "application/json",
-        "x-goog-api-key": GEMINI_API_KEY,
-    }
-    payload = {
-        "system_instruction": {"parts": [{"text": GEMINI_SYSTEM}]},
-        "contents": [{"role": "user",
-                      "parts": [{"text": "UART LOG:\n\n" + uart_log}]}],
-        "generationConfig": {"response_mime_type": "application/json",
-                             "temperature": 0.2},
-    }
     try:
-        r = requests.post(url, headers=headers, json=payload, timeout=60)
-        if r.status_code != 200:
-            return "error", {"error": "AI_HTTP_%d" % r.status_code,
-                             "message": r.text[:300]}
-        data = r.json()
-        text = (data["candidates"][0]["content"]["parts"][0]["text"])
+        import google.generativeai as genai
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel(
+            GEMINI_MODEL,
+            system_instruction=GEMINI_SYSTEM)
+        resp = model.generate_content(
+            "UART LOG:\n\n" + uart_log,
+            generation_config={"response_mime_type": "application/json",
+                               "temperature": 0.2})
+        text = resp.text
         try:
             result = json.loads(text)
         except Exception:
             result = {"overall_status": "UNKNOWN", "raw": text}
         return "ok", result
     except Exception as e:
-        return "error", {"error": "AI_EXCEPTION", "message": str(e)}
+        return "error", {"error": "AI_EXCEPTION", "message": str(e)[:400]}
 
 
 def save_report(body, ai_status, ai_result, client_ip):
@@ -271,19 +261,17 @@ def admin_test_ai():
         "key_present": bool(GEMINI_API_KEY),
         "key_prefix": (GEMINI_API_KEY[:6] + "...") if GEMINI_API_KEY else "",
     }
-    # call Gemini with a tiny prompt and capture the RAW response
-    url = ("https://generativelanguage.googleapis.com/v1beta/models/"
-           f"{GEMINI_MODEL}:generateContent")
-    headers = {"Content-Type": "application/json",
-               "x-goog-api-key": GEMINI_API_KEY}
-    payload = {"contents": [{"role": "user",
-                             "parts": [{"text": "Say OK"}]}]}
+    # call Gemini via the official SDK and capture the result/error
     try:
-        r = requests.post(url, headers=headers, json=payload, timeout=30)
-        info["http_status"] = r.status_code
-        info["gemini_response"] = r.text[:1500]
+        import google.generativeai as genai
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        resp = model.generate_content("Say OK")
+        info["ok"] = True
+        info["gemini_reply"] = resp.text[:500]
     except Exception as e:
-        info["exception"] = str(e)
+        info["ok"] = False
+        info["error"] = str(e)[:800]
     return Response(json.dumps(info, indent=2), mimetype="application/json")
 
 
