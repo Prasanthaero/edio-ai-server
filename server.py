@@ -360,6 +360,120 @@ def admin_test_ai():
     return Response(json.dumps(info, indent=2), mimetype="application/json")
 
 
+# ── ADMIN: a nice HTML dashboard (open in a browser) ──
+# /admin/dashboard?token=YOUR_ADMIN_TOKEN
+@app.route("/admin/dashboard", methods=["GET"])
+def admin_dashboard():
+    token = request.args.get("token", "")
+    if not EDIO_ADMIN_TOKEN or token != EDIO_ADMIN_TOKEN:
+        return Response("Forbidden", status=403)
+    con = _db()
+    total = con.execute("SELECT COUNT(*) c FROM reports").fetchone()["c"]
+    rows = con.execute(
+        "SELECT id, created_at, product, app_version, device_id, license_key, "
+        "ai_status, client_ip FROM reports ORDER BY id DESC LIMIT 500"
+    ).fetchall()
+    con.close()
+
+    trs = []
+    for r in rows:
+        trs.append(
+            "<tr>"
+            f"<td>{r['id']}</td>"
+            f"<td>{r['created_at'] or ''}</td>"
+            f"<td>{r['device_id'] or ''}</td>"
+            f"<td>{r['license_key'] or ''}</td>"
+            f"<td>{r['app_version'] or ''}</td>"
+            f"<td><span class='st {r['ai_status']}'>{r['ai_status'] or ''}</span></td>"
+            f"<td>{r['client_ip'] or ''}</td>"
+            f"<td><a class='btn' href='/admin/report/{r['id']}?token={token}' "
+            "target='_blank'>View</a></td>"
+            "</tr>")
+    body = "".join(trs) or "<tr><td colspan=8>No reports yet.</td></tr>"
+
+    html = (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<title>EDIO Smart Clone - Reports</title>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<style>"
+        "body{font-family:Segoe UI,Arial,sans-serif;background:#0b0f17;"
+        "color:#e9eef7;margin:0}"
+        "header{background:#121824;padding:16px 24px;border-bottom:1px solid #26324a}"
+        "h1{margin:0;font-size:20px;color:#4f7cff}"
+        ".sub{color:#8b9bb4;font-size:13px;margin-top:4px}"
+        ".wrap{padding:20px 24px}"
+        ".bar{display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap}"
+        "input,a.tool{background:#141b28;border:1px solid #26324a;color:#e9eef7;"
+        "padding:8px 12px;border-radius:6px;text-decoration:none;font-size:13px}"
+        "table{width:100%;border-collapse:collapse;font-size:13px}"
+        "th,td{text-align:left;padding:8px 10px;border-bottom:1px solid #1c2637}"
+        "th{color:#8b9bb4;font-weight:600}"
+        "tr:hover{background:#121824}"
+        ".btn{background:#4f7cff;color:#fff;padding:5px 10px;border-radius:5px;"
+        "text-decoration:none;font-size:12px}"
+        ".st{padding:2px 8px;border-radius:10px;font-size:11px;font-weight:700}"
+        ".st.ok{background:#123a2a;color:#2fe3c6}"
+        ".st.error{background:#3a1520;color:#ff5d6c}"
+        "</style></head><body>"
+        "<header><h1>EDIO Smart Clone - Analysis Reports</h1>"
+        f"<div class='sub'>{total} total reports - showing latest {len(rows)}</div>"
+        "</header><div class='wrap'><div class='bar'>"
+        "<input id='q' placeholder='Search device / license / status...' "
+        "onkeyup='filt()' style='flex:1;min-width:200px'>"
+        f"<a class='tool' href='/admin/export.csv?token={token}'>Download CSV</a>"
+        f"<a class='tool' href='/admin/stats?token={token}' target='_blank'>Stats</a>"
+        "</div><table id='t'><thead><tr><th>ID</th><th>Time</th><th>Device</th>"
+        "<th>License</th><th>Ver</th><th>Status</th><th>IP</th><th></th></tr>"
+        f"</thead><tbody>{body}</tbody></table></div>"
+        "<script>function filt(){var q=document.getElementById('q').value"
+        ".toLowerCase();var rows=document.querySelectorAll('#t tbody tr');"
+        "rows.forEach(function(r){r.style.display=r.innerText.toLowerCase()"
+        ".indexOf(q)>-1?'':'none';});}</script></body></html>")
+    return Response(html, mimetype="text/html")
+
+
+# ── ADMIN: view ONE full report (UART log + AI diagnosis) ──
+@app.route("/admin/report/<int:rid>", methods=["GET"])
+def admin_one_report(rid):
+    token = request.args.get("token", "")
+    if not EDIO_ADMIN_TOKEN or token != EDIO_ADMIN_TOKEN:
+        return Response("Forbidden", status=403)
+    con = _db()
+    r = con.execute("SELECT * FROM reports WHERE id=?", (rid,)).fetchone()
+    con.close()
+    if not r:
+        return Response("Not found", status=404)
+    import html as _html
+    try:
+        ai = json.dumps(json.loads(r["ai_result"]), indent=2, ensure_ascii=False)
+    except Exception:
+        ai = r["ai_result"] or ""
+    page = (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        f"<title>Report #{r['id']}</title><style>"
+        "body{font-family:Segoe UI,Arial;background:#0b0f17;color:#e9eef7;margin:0}"
+        "header{background:#121824;padding:14px 24px;border-bottom:1px solid #26324a}"
+        "a{color:#4f7cff}.wrap{padding:20px 24px;display:flex;gap:20px;"
+        "flex-wrap:wrap}.col{flex:1;min-width:340px}h2{color:#4f7cff;font-size:15px}"
+        "pre{background:#0a0f1a;border:1px solid #26324a;border-radius:8px;"
+        "padding:14px;white-space:pre-wrap;word-break:break-word;"
+        "font-family:Consolas,monospace;font-size:12px;max-height:70vh;overflow:auto}"
+        ".meta td{padding:4px 10px}.meta td:first-child{color:#8b9bb4}"
+        "</style></head><body>"
+        f"<header><a href='/admin/dashboard?token={token}'>Back to all reports</a>"
+        f" | Report #{r['id']} - {r['created_at']}</header><div class='wrap'>"
+        "<div class='col'><h2>Details</h2><table class='meta'>"
+        f"<tr><td>Device</td><td>{_html.escape(r['device_id'] or '')}</td></tr>"
+        f"<tr><td>License</td><td>{_html.escape(r['license_key'] or '')}</td></tr>"
+        f"<tr><td>App ver</td><td>{_html.escape(r['app_version'] or '')}</td></tr>"
+        f"<tr><td>Status</td><td>{r['ai_status']}</td></tr>"
+        f"<tr><td>IP</td><td>{r['client_ip'] or ''}</td></tr></table>"
+        f"<h2>UART LOG</h2><pre>{_html.escape(r['uart_log'] or '')}</pre></div>"
+        f"<div class='col'><h2>AI DIAGNOSIS</h2><pre>{_html.escape(ai)}</pre>"
+        "</div></div></body></html>")
+    return Response(page, mimetype="text/html")
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
