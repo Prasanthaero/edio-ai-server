@@ -257,6 +257,36 @@ def admin_stats():
                     "top_devices": [dict(r) for r in by_dev]})
 
 
+# ── DEBUG: test Gemini directly and show the REAL error (admin only) ──
+# Open in a browser:  /admin/test-ai?token=YOUR_ADMIN_TOKEN
+# It sends a tiny test log to Gemini and shows exactly what Gemini replies,
+# so you can see the real error (bad key, wrong model, quota, etc.).
+@app.route("/admin/test-ai", methods=["GET"])
+def admin_test_ai():
+    token = request.args.get("token", "")
+    if not EDIO_ADMIN_TOKEN or token != EDIO_ADMIN_TOKEN:
+        return Response("Forbidden", status=403)
+    info = {
+        "model": GEMINI_MODEL,
+        "key_present": bool(GEMINI_API_KEY),
+        "key_prefix": (GEMINI_API_KEY[:6] + "...") if GEMINI_API_KEY else "",
+    }
+    # call Gemini with a tiny prompt and capture the RAW response
+    url = ("https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{GEMINI_MODEL}:generateContent")
+    headers = {"Content-Type": "application/json",
+               "x-goog-api-key": GEMINI_API_KEY}
+    payload = {"contents": [{"role": "user",
+                             "parts": [{"text": "Say OK"}]}]}
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=30)
+        info["http_status"] = r.status_code
+        info["gemini_response"] = r.text[:1500]
+    except Exception as e:
+        info["exception"] = str(e)
+    return Response(json.dumps(info, indent=2), mimetype="application/json")
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
