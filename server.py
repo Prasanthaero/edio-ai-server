@@ -97,23 +97,30 @@ GEMINI_SYSTEM = (
 
 
 def call_gemini(uart_log):
-    """Call Gemini using the OFFICIAL google-generativeai SDK. The SDK handles
-    the new AQ. auth keys correctly (the raw REST endpoint can time out / reject
-    them). Returns (status, result_dict)."""
+    """Call Gemini via the lightweight REST API (no heavy SDK — the SDK uses
+    too much memory for Render's free plan). Sends the key as a header so the
+    new AQ. auth keys work. Returns (status, result_dict)."""
     if not GEMINI_API_KEY:
         return "error", {"error": "SERVER_NO_KEY",
                          "message": "AI key not configured on the server."}
+    url = ("https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{GEMINI_MODEL}:generateContent")
+    headers = {"Content-Type": "application/json",
+               "x-goog-api-key": GEMINI_API_KEY}
+    payload = {
+        "system_instruction": {"parts": [{"text": GEMINI_SYSTEM}]},
+        "contents": [{"role": "user",
+                      "parts": [{"text": "UART LOG:\n\n" + uart_log}]}],
+        "generationConfig": {"response_mime_type": "application/json",
+                             "temperature": 0.2},
+    }
     try:
-        import google.generativeai as genai
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel(
-            GEMINI_MODEL,
-            system_instruction=GEMINI_SYSTEM)
-        resp = model.generate_content(
-            "UART LOG:\n\n" + uart_log,
-            generation_config={"response_mime_type": "application/json",
-                               "temperature": 0.2})
-        text = resp.text
+        r = requests.post(url, headers=headers, json=payload, timeout=90)
+        if r.status_code != 200:
+            return "error", {"error": "AI_HTTP_%d" % r.status_code,
+                             "message": r.text[:400]}
+        data = r.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
         try:
             result = json.loads(text)
         except Exception:
@@ -261,17 +268,18 @@ def admin_test_ai():
         "key_present": bool(GEMINI_API_KEY),
         "key_prefix": (GEMINI_API_KEY[:6] + "...") if GEMINI_API_KEY else "",
     }
-    # call Gemini via the official SDK and capture the result/error
+    # lightweight REST test (no heavy SDK)
+    url = ("https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{GEMINI_MODEL}:generateContent")
+    headers = {"Content-Type": "application/json",
+               "x-goog-api-key": GEMINI_API_KEY}
+    payload = {"contents": [{"role": "user", "parts": [{"text": "Say OK"}]}]}
     try:
-        import google.generativeai as genai
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        resp = model.generate_content("Say OK")
-        info["ok"] = True
-        info["gemini_reply"] = resp.text[:500]
+        r = requests.post(url, headers=headers, json=payload, timeout=90)
+        info["http_status"] = r.status_code
+        info["gemini_response"] = r.text[:1200]
     except Exception as e:
-        info["ok"] = False
-        info["error"] = str(e)[:800]
+        info["exception"] = repr(e)[:600]
     return Response(json.dumps(info, indent=2), mimetype="application/json")
 
 
