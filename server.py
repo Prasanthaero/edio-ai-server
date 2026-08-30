@@ -1,73 +1,91 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EDIO AI backend — UART diagnostic server
-========================================
-This is the SERVER that sits between the Smart Clone desktop app and Google
-Gemini. It keeps your Gemini API key SAFE (the key lives here, on the server,
-never in the app that customers download).
+server.py — EDIO Smart Clone AI backend
+=======================================
+This runs on YOUR server (Render / any VPS). The desktop app POSTs each UART
+log here; this server:
 
-  Smart Clone app  ──HTTPS──▶  THIS SERVER  ──▶  Google Gemini
-                                     │
-              structured report ◀────┘
+  1. Checks the app token (so random people can't use your endpoint).
+  2. Calls Gemini with YOUR key (the key stays HERE, never in the app).
+  3. SAVES every analysis report to a database (this is what you asked for —
+     you get ALL the data: who, which device, the log, and the diagnosis).
+  4. Returns the diagnosis to the customer's app.
 
-HOW TO RUN (locally, to test):
-    pip install flask google-generativeai
-    set GEMINI_API_KEY=your-key-here      (Windows)
-    export GEMINI_API_KEY=your-key-here   (Mac/Linux)
-    python server.py
-  → it listens on http://localhost:8000
+You get an admin page to see every report: GET /admin/reports?token=ADMIN_TOKEN
 
-HOW TO DEPLOY FREE (Render.com):  see README_DEPLOY.txt
-
-The desktop app should point at this server:
-    config.py →  AI_API_URL = "https://<your-app>.onrender.com/ai"
-                 AI_ENABLED = True
-                 AI_DIRECT_GEMINI = False   (turn OFF direct mode)
+--------------------------------------------------------------------------
+ENVIRONMENT VARIABLES to set on Render (Settings → Environment):
+    GEMINI_API_KEY   = AIzaSy...        (your Google Gemini key)
+    EDIO_APP_TOKEN   = long-random-1    (must match config.AI_APP_TOKEN in app)
+    EDIO_ADMIN_TOKEN = long-random-2    (your private key to view reports)
+    GEMINI_MODEL     = gemini-flash-latest   (optional)
+--------------------------------------------------------------------------
+Run locally:   pip install flask requests
+               python server.py
+On Render:     Start command →  gunicorn server:app
 """
 
-import os
 import json
+import os
+import sqlite3
 import time
+import uuid
 
-from flask import Flask, request, jsonify
-
-# ── Gemini setup ─────────────────────────────────────────────────────────────
-# The key comes from an ENVIRONMENT VARIABLE, never hard-coded. On Render you
-# set GEMINI_API_KEY in the dashboard; locally you export it in your shell.
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL   = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash").strip()
-
-# a simple shared token the app can send so random people can't use your server.
-# Set EDIO_APP_TOKEN on the server AND put the same value in the app request.
-# (Optional but recommended. Leave empty to skip this check while testing.)
-APP_TOKEN = os.environ.get("EDIO_APP_TOKEN", "").strip()
-
-try:
-    import google.generativeai as genai
-    if GEMINI_API_KEY:
-        genai.configure(api_key=GEMINI_API_KEY)
-    _GENAI_OK = True
-except Exception:
-    _GENAI_OK = False
+import requests
+from flask import Flask, request, jsonify, Response
 
 app = Flask(__name__)
 
-# the strict diagnostic instruction Gemini follows
-SYSTEM_PROMPT = (
-    "You are EDIO AI, a professional TV motherboard UART diagnostic engineer. "
-    "You are given a UART/serial boot log from a TV mainboard. Analyze the boot "
-    "sequence: SoC/boot ROM, bootloader (U-Boot etc.), DDR init, eMMC/NAND/NOR, "
-    "PMIC, I2C, SPI, Ethernet/Wi-Fi, kernel load and init, Android/Linux startup, "
-    "watchdog, reboot loops, kernel panic, device-tree, drivers, power.\n"
-    "RULES: Base every finding ONLY on evidence in the log. Never invent a "
-    "chipset, voltage, component, error or diagnosis not present in the log. "
-    "Separate UART evidence from technician verification (e.g. do not say 'eMMC "
-    "is damaged'; say 'repeated eMMC timeouts confirm an eMMC comms failure; the "
-    "physical cause needs bench verification', then list checks like VCC, VCCQ, "
-    "CLK, CMD, DAT, soldering, known-good compare). For every critical finding, "
-    "include the exact UART line(s) as evidence.\n"
-    "Respond with ONLY valid JSON in exactly this schema (no prose outside JSON):\n"
+# ── config from environment (NEVER hardcode secrets) ──
+GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY", "")
+EDIO_APP_TOKEN   = os.environ.get("EDIO_APP_TOKEN", "")
+EDIO_ADMIN_TOKEN = os.environ.get("EDIO_ADMIN_TOKEN", "")
+GEMINI_MODEL     = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+
+# ── database (SQLite file). On Render, mount a Disk so it persists. ──
+DB_PATH = os.environ.get("EDIO_DB_PATH",
+                         os.path.join(os.path.dirname(__file__), "reports.db"))
+
+
+def _db():
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def init_db():
+    con = _db()
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS reports (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts           INTEGER,
+            created_at   TEXT,
+            product      TEXT,
+            app_version  TEXT,
+            device_id    TEXT,
+            license_key  TEXT,
+            session_id   TEXT,
+            uart_log     TEXT,
+            meta         TEXT,
+            ai_status    TEXT,
+            ai_result    TEXT,
+            client_ip    TEXT
+        )
+    """)
+    con.commit()
+    con.close()
+
+
+init_db()
+
+
+# ── the AI system prompt (same schema your app expects) ──
+GEMINI_SYSTEM = (
+    "You are an expert TV/embedded repair engineer. Analyse the UART/serial "
+    "boot log and return a repair diagnosis. Base every claim on the log; if "
+    "unsure, say UNKNOWN. Respond with ONLY valid JSON in exactly this schema "
+    "(no prose outside JSON):\n"
     '{"overall_status":"PASS|WARNING|FAILED|UNKNOWN",'
     '"platform":{"soc":"","bootloader":"","operating_system":""},'
     '"boot_stage":"","confirmed_findings":[],"critical_errors":[],"warnings":[],'
@@ -78,98 +96,160 @@ SYSTEM_PROMPT = (
 )
 
 
-# ── health check (open in a browser to confirm the server is up) ─────────────
-@app.get("/")
-def home():
-    return jsonify(service="EDIO AI", status="ok",
-                   gemini=bool(GEMINI_API_KEY and _GENAI_OK),
-                   model=GEMINI_MODEL)
-
-
-# ── the endpoint the app calls ───────────────────────────────────────────────
-@app.post("/ai/analyze-uart")
-def analyze_uart():
-    # 0) basic app-token gate (optional)
-    if APP_TOKEN:
-        sent = request.headers.get("X-EDIO-Token", "")
-        if sent != APP_TOKEN:
-            return jsonify(ok=False, error="AUTHENTICATION_ERROR",
-                           message="App token missing or invalid."), 401
-
-    # 1) parse request
+def call_gemini(uart_log):
+    """Call Gemini and return (status, result_dict)."""
+    if not GEMINI_API_KEY:
+        return "error", {"error": "SERVER_NO_KEY",
+                         "message": "AI key not configured on the server."}
+    url = ("https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}")
+    payload = {
+        "system_instruction": {"parts": [{"text": GEMINI_SYSTEM}]},
+        "contents": [{"role": "user",
+                      "parts": [{"text": "UART LOG:\n\n" + uart_log}]}],
+        "generationConfig": {"response_mime_type": "application/json",
+                             "temperature": 0.2},
+    }
     try:
-        data = request.get_json(force=True) or {}
-    except Exception:
-        return jsonify(ok=False, error="SERVER_ERROR",
-                       message="Bad request body."), 400
-
-    uart_log = (data.get("uart_log") or "").strip()
-    if not uart_log:
-        return jsonify(ok=False, error="EMPTY_LOG",
-                       message="No UART log provided.")
-
-    # 1a) simple size guard (the app already trims, but be safe)
-    if len(uart_log) > 200_000:
-        return jsonify(ok=False, error="LOG_TOO_LARGE",
-                       message="UART log is too large.")
-
-    # ── (Optional) verify license/usage here ──
-    # device_id  = data.get("device_id")
-    # license_key = data.get("license_key")
-    # check them against your license DB, enforce monthly limits, etc.
-    # If not allowed → return jsonify(ok=False, error="LICENSE_ERROR"), 403
-
-    # 2) make sure Gemini is configured
-    if not (GEMINI_API_KEY and _GENAI_OK):
-        return jsonify(ok=False, error="SERVER_ERROR",
-                       message="AI is not configured on the server."), 500
-
-    # 3) call Gemini
-    try:
-        model = genai.GenerativeModel(GEMINI_MODEL,
-                                      system_instruction=SYSTEM_PROMPT)
-        resp = model.generate_content(
-            "UART LOG:\n\n" + uart_log,
-            generation_config={"response_mime_type": "application/json",
-                               "temperature": 0.2})
-        text = resp.text
+        r = requests.post(url, json=payload, timeout=60)
+        if r.status_code != 200:
+            return "error", {"error": "AI_HTTP_%d" % r.status_code,
+                             "message": r.text[:300]}
+        data = r.json()
+        text = (data["candidates"][0]["content"]["parts"][0]["text"])
+        try:
+            result = json.loads(text)
+        except Exception:
+            result = {"overall_status": "UNKNOWN", "raw": text}
+        return "ok", result
     except Exception as e:
-        # network / provider / quota problems
-        msg = str(e).lower()
-        if "quota" in msg or "rate" in msg or "429" in msg:
-            return jsonify(ok=False, error="RATE_LIMIT_ERROR"), 429
-        return jsonify(ok=False, error="AI_PROVIDER_ERROR",
-                       message="AI service error."), 502
-
-    # 4) parse + validate the AI's JSON
-    report = _parse_report(text)
-    if report is None:
-        return jsonify(ok=False, error="INVALID_AI_RESPONSE",
-                       message="AI returned an unexpected result.")
-
-    # 5) (optional) record usage, then discard the raw log (privacy)
-    return jsonify(ok=True,
-                   session_id=data.get("session_id", str(int(time.time()))),
-                   report=report)
+        return "error", {"error": "AI_EXCEPTION", "message": str(e)}
 
 
-def _parse_report(text):
-    """Turn the model's text into a dict, tolerating ```json fences."""
-    if not text:
-        return None
+def save_report(body, ai_status, ai_result, client_ip):
+    """Save EVERY analysis to the database — this is your data."""
+    con = _db()
+    con.execute(
+        """INSERT INTO reports
+           (ts, created_at, product, app_version, device_id, license_key,
+            session_id, uart_log, meta, ai_status, ai_result, client_ip)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (int(time.time()),
+         time.strftime("%Y-%m-%d %H:%M:%S"),
+         body.get("product", ""),
+         body.get("app_version", ""),
+         body.get("device_id", ""),
+         body.get("license_key", ""),
+         body.get("session_id", ""),
+         body.get("uart_log", ""),
+         json.dumps(body.get("meta", {})),
+         ai_status,
+         json.dumps(ai_result),
+         client_ip))
+    con.commit()
+    con.close()
+
+
+# ── health check ──
+@app.route("/", methods=["GET"])
+@app.route("/ai", methods=["GET"])
+def home():
+    return jsonify({"ok": True, "service": "EDIO Smart Clone AI",
+                    "model": GEMINI_MODEL})
+
+
+# ── the main endpoint the app calls ──
+@app.route("/ai/analyze-uart", methods=["POST"])
+def analyze_uart():
+    # 1) check the app token (stops outsiders using your AI)
+    token = request.headers.get("X-EDIO-Token", "")
+    if EDIO_APP_TOKEN and token != EDIO_APP_TOKEN:
+        return jsonify({"ok": False, "error": "AUTHENTICATION_ERROR",
+                        "message": "Invalid app token."}), 403
+
+    body = request.get_json(silent=True) or {}
+    uart_log = (body.get("uart_log") or "").strip()
+    if not uart_log:
+        return jsonify({"ok": False, "error": "EMPTY_LOG",
+                        "message": "No UART log provided."}), 400
+
+    # (Optional) per-license limit could go here — see LIMIT note below.
+
+    # 2) call the AI
+    ai_status, ai_result = call_gemini(uart_log)
+
+    # 3) SAVE the report (your data!)
+    client_ip = request.headers.get("X-Forwarded-For",
+                                    request.remote_addr or "")
     try:
-        return json.loads(text)
-    except Exception:
-        pass
-    cleaned = text.strip().strip("`")
-    if cleaned.lower().startswith("json"):
-        cleaned = cleaned[4:].strip()
-    try:
-        return json.loads(cleaned)
-    except Exception:
-        return None
+        save_report(body, ai_status, ai_result, client_ip)
+    except Exception as e:
+        # never fail the customer just because saving failed; log it
+        print("[WARN] save_report failed:", e)
+
+    # 4) return the result to the app
+    if ai_status == "ok":
+        return jsonify({"ok": True, "result": ai_result})
+    else:
+        return jsonify({"ok": False, "error": ai_result.get("error", "AI_ERROR"),
+                        "message": ai_result.get("message", "")}), 502
+
+
+# ── ADMIN: view all reports (only you, with the admin token) ──
+@app.route("/admin/reports", methods=["GET"])
+def admin_reports():
+    token = request.args.get("token", "")
+    if not EDIO_ADMIN_TOKEN or token != EDIO_ADMIN_TOKEN:
+        return Response("Forbidden", status=403)
+    limit = int(request.args.get("limit", "100"))
+    con = _db()
+    rows = con.execute(
+        "SELECT * FROM reports ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    con.close()
+    out = [dict(r) for r in rows]
+    # pretty JSON so you can read it in a browser
+    return Response(json.dumps(out, indent=2, ensure_ascii=False),
+                    mimetype="application/json")
+
+
+# ── ADMIN: download everything as CSV (open in Excel) ──
+@app.route("/admin/export.csv", methods=["GET"])
+def admin_export_csv():
+    token = request.args.get("token", "")
+    if not EDIO_ADMIN_TOKEN or token != EDIO_ADMIN_TOKEN:
+        return Response("Forbidden", status=403)
+    import csv
+    import io
+    con = _db()
+    rows = con.execute("SELECT * FROM reports ORDER BY id DESC").fetchall()
+    con.close()
+    buf = io.StringIO()
+    if rows:
+        w = csv.DictWriter(buf, fieldnames=rows[0].keys())
+        w.writeheader()
+        for r in rows:
+            w.writerow(dict(r))
+    return Response(buf.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition":
+                             "attachment; filename=edio_reports.csv"})
+
+
+# ── ADMIN: simple stats ──
+@app.route("/admin/stats", methods=["GET"])
+def admin_stats():
+    token = request.args.get("token", "")
+    if not EDIO_ADMIN_TOKEN or token != EDIO_ADMIN_TOKEN:
+        return Response("Forbidden", status=403)
+    con = _db()
+    total = con.execute("SELECT COUNT(*) c FROM reports").fetchone()["c"]
+    by_dev = con.execute(
+        "SELECT device_id, COUNT(*) c FROM reports GROUP BY device_id "
+        "ORDER BY c DESC LIMIT 20").fetchall()
+    con.close()
+    return jsonify({"total_reports": total,
+                    "top_devices": [dict(r) for r in by_dev]})
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8000"))
+    port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
