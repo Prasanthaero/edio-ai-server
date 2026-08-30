@@ -240,9 +240,11 @@ def analyze_uart():
         # never fail the customer just because saving failed; log it
         print("[WARN] save_report failed:", e)
 
-    # 4) return the result to the app
+    # 4) return the result to the app. The app expects the diagnosis under the
+    # key "report" (and a session_id), so we send it in that exact shape.
     if ai_status == "ok":
-        return jsonify({"ok": True, "result": ai_result})
+        return jsonify({"ok": True, "report": ai_result,
+                        "session_id": body.get("session_id", "")})
     else:
         return jsonify({"ok": False, "error": ai_result.get("error", "AI_ERROR"),
                         "message": ai_result.get("message", "")}), 502
