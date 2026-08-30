@@ -39,9 +39,16 @@ app = Flask(__name__)
 
 # ── config from environment (NEVER hardcode secrets) ──
 GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL     = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+# Groq (free, fast) — if GROQ_API_KEY is set, the server uses Groq instead of
+# Gemini. Get a free key at https://console.groq.com/keys
+GROQ_API_KEY     = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL       = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+# which provider to use: "groq" if a Groq key is present, else "gemini"
+AI_PROVIDER      = os.environ.get("AI_PROVIDER",
+                                  "groq" if GROQ_API_KEY else "gemini")
 EDIO_APP_TOKEN   = os.environ.get("EDIO_APP_TOKEN", "")
 EDIO_ADMIN_TOKEN = os.environ.get("EDIO_ADMIN_TOKEN", "")
-GEMINI_MODEL     = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 
 # ── database (SQLite file). On Render, mount a Disk so it persists. ──
 DB_PATH = os.environ.get("EDIO_DB_PATH",
@@ -96,6 +103,40 @@ GEMINI_SYSTEM = (
 )
 
 
+def call_groq(uart_log):
+    """Call Groq (free, fast) with an OpenAI-compatible REST API. Returns
+    (status, result_dict)."""
+    if not GROQ_API_KEY:
+        return "error", {"error": "SERVER_NO_KEY",
+                         "message": "Groq key not configured on the server."}
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {"Content-Type": "application/json",
+               "Authorization": "Bearer " + GROQ_API_KEY}
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": GEMINI_SYSTEM},
+            {"role": "user", "content": "UART LOG:\n\n" + uart_log},
+        ],
+        "temperature": 0.2,
+        "response_format": {"type": "json_object"},
+    }
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=90)
+        if r.status_code != 200:
+            return "error", {"error": "AI_HTTP_%d" % r.status_code,
+                             "message": r.text[:400]}
+        data = r.json()
+        text = data["choices"][0]["message"]["content"]
+        try:
+            result = json.loads(text)
+        except Exception:
+            result = {"overall_status": "UNKNOWN", "raw": text}
+        return "ok", result
+    except Exception as e:
+        return "error", {"error": "AI_EXCEPTION", "message": str(e)[:400]}
+
+
 def call_gemini(uart_log):
     """Call Gemini via the lightweight REST API (no heavy SDK — the SDK uses
     too much memory for Render's free plan). Sends the key as a header so the
@@ -130,6 +171,13 @@ def call_gemini(uart_log):
         return "error", {"error": "AI_EXCEPTION", "message": str(e)[:400]}
 
 
+def call_ai(uart_log):
+    """Route to the configured AI provider (Groq preferred if a key is set)."""
+    if AI_PROVIDER == "groq" and GROQ_API_KEY:
+        return call_groq(uart_log)
+    return call_gemini(uart_log)
+
+
 def save_report(body, ai_status, ai_result, client_ip):
     """Save EVERY analysis to the database — this is your data."""
     con = _db()
@@ -158,8 +206,9 @@ def save_report(body, ai_status, ai_result, client_ip):
 @app.route("/", methods=["GET"])
 @app.route("/ai", methods=["GET"])
 def home():
+    model = GROQ_MODEL if AI_PROVIDER == "groq" else GEMINI_MODEL
     return jsonify({"ok": True, "service": "EDIO Smart Clone AI",
-                    "model": GEMINI_MODEL})
+                    "provider": AI_PROVIDER, "model": model})
 
 
 # ── the main endpoint the app calls ──
@@ -179,8 +228,8 @@ def analyze_uart():
 
     # (Optional) per-license limit could go here — see LIMIT note below.
 
-    # 2) call the AI
-    ai_status, ai_result = call_gemini(uart_log)
+    # 2) call the AI (Groq if configured, else Gemini)
+    ai_status, ai_result = call_ai(uart_log)
 
     # 3) SAVE the report (your data!)
     client_ip = request.headers.get("X-Forwarded-For",
@@ -264,22 +313,15 @@ def admin_test_ai():
     if not EDIO_ADMIN_TOKEN or token != EDIO_ADMIN_TOKEN:
         return Response("Forbidden", status=403)
     info = {
-        "model": GEMINI_MODEL,
-        "key_present": bool(GEMINI_API_KEY),
-        "key_prefix": (GEMINI_API_KEY[:6] + "...") if GEMINI_API_KEY else "",
+        "provider": AI_PROVIDER,
+        "groq_key_present": bool(GROQ_API_KEY),
+        "gemini_key_present": bool(GEMINI_API_KEY),
+        "model": GROQ_MODEL if AI_PROVIDER == "groq" else GEMINI_MODEL,
     }
-    # lightweight REST test (no heavy SDK)
-    url = ("https://generativelanguage.googleapis.com/v1beta/models/"
-           f"{GEMINI_MODEL}:generateContent")
-    headers = {"Content-Type": "application/json",
-               "x-goog-api-key": GEMINI_API_KEY}
-    payload = {"contents": [{"role": "user", "parts": [{"text": "Say OK"}]}]}
-    try:
-        r = requests.post(url, headers=headers, json=payload, timeout=90)
-        info["http_status"] = r.status_code
-        info["gemini_response"] = r.text[:1200]
-    except Exception as e:
-        info["exception"] = repr(e)[:600]
+    # run a tiny real analysis through the active provider
+    status, result = call_ai("U-Boot test log. Say OK.")
+    info["status"] = status
+    info["result"] = result
     return Response(json.dumps(info, indent=2), mimetype="application/json")
 
 
