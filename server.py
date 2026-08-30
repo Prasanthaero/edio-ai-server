@@ -119,7 +119,23 @@ GEMINI_SYSTEM = (
 )
 
 
-def call_groq(uart_log):
+def _system_for(language):
+    """Return the system prompt, adding a 'reply in this language' instruction
+    when a non-English language is requested. The JSON keys stay English; only
+    the human-readable values are translated."""
+    lang = (language or "English").strip()
+    if not lang or lang.lower() in ("english", "en"):
+        return GEMINI_SYSTEM
+    return (GEMINI_SYSTEM +
+            f"\n\nIMPORTANT: Write ALL human-readable text values in the JSON "
+            f"(findings, causes, checks, repair actions, command notes, fault "
+            f"area, root cause, etc.) in {lang}. Keep the JSON keys and the "
+            f"status words (PASS/WARNING/FAILED/UNKNOWN) in English, and keep "
+            f"technical tokens (command names, register names, part numbers) "
+            f"unchanged. Everything a technician reads must be in {lang}.")
+
+
+def call_groq(uart_log, language="English"):
     """Call Groq (free, fast) with an OpenAI-compatible REST API. Returns
     (status, result_dict)."""
     if not GROQ_API_KEY:
@@ -131,7 +147,7 @@ def call_groq(uart_log):
     payload = {
         "model": GROQ_MODEL,
         "messages": [
-            {"role": "system", "content": GEMINI_SYSTEM},
+            {"role": "system", "content": _system_for(language)},
             {"role": "user", "content": "UART LOG:\n\n" + uart_log},
         ],
         "temperature": 0.2,
@@ -153,7 +169,7 @@ def call_groq(uart_log):
         return "error", {"error": "AI_EXCEPTION", "message": str(e)[:400]}
 
 
-def call_gemini(uart_log):
+def call_gemini(uart_log, language="English"):
     """Call Gemini via the lightweight REST API (no heavy SDK — the SDK uses
     too much memory for Render's free plan). Sends the key as a header so the
     new AQ. auth keys work. Returns (status, result_dict)."""
@@ -165,7 +181,7 @@ def call_gemini(uart_log):
     headers = {"Content-Type": "application/json",
                "x-goog-api-key": GEMINI_API_KEY}
     payload = {
-        "system_instruction": {"parts": [{"text": GEMINI_SYSTEM}]},
+        "system_instruction": {"parts": [{"text": _system_for(language)}]},
         "contents": [{"role": "user",
                       "parts": [{"text": "UART LOG:\n\n" + uart_log}]}],
         "generationConfig": {"response_mime_type": "application/json",
@@ -187,11 +203,11 @@ def call_gemini(uart_log):
         return "error", {"error": "AI_EXCEPTION", "message": str(e)[:400]}
 
 
-def call_ai(uart_log):
+def call_ai(uart_log, language="English"):
     """Route to the configured AI provider (Groq preferred if a key is set)."""
     if AI_PROVIDER == "groq" and GROQ_API_KEY:
-        return call_groq(uart_log)
-    return call_gemini(uart_log)
+        return call_groq(uart_log, language)
+    return call_gemini(uart_log, language)
 
 
 def save_report(body, ai_status, ai_result, client_ip):
@@ -245,7 +261,8 @@ def analyze_uart():
     # (Optional) per-license limit could go here — see LIMIT note below.
 
     # 2) call the AI (Groq if configured, else Gemini)
-    ai_status, ai_result = call_ai(uart_log)
+    language = (body.get("language") or "English").strip() or "English"
+    ai_status, ai_result = call_ai(uart_log, language)
 
     # 3) SAVE the report (your data!)
     client_ip = request.headers.get("X-Forwarded-For",
