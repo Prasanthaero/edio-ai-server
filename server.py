@@ -485,6 +485,51 @@ def admin_one_report(rid):
     return Response(page, mimetype="text/html")
 
 
+# ═══════════════════════════════════════════════════════════════════════
+#  AUTO-UPDATE — serve version.json + update files from THIS server
+# ═══════════════════════════════════════════════════════════════════════
+# You upload updated .py files to an "updates/" folder next to server.py and
+# edit update_version.json. The app checks /update/version.json on launch, and
+# if the version is newer it downloads the changed files from /update/files/…
+# The customer NEVER installs a new EXE — the app updates its own .py files.
+UPDATE_DIR = os.path.join(os.path.dirname(__file__), "updates")
+
+
+@app.route("/update/version.json", methods=["GET"])
+def update_version():
+    """Return the current update manifest. Edit update_version.json in the
+    updates/ folder to publish a new version."""
+    manifest = os.path.join(UPDATE_DIR, "version.json")
+    if os.path.exists(manifest):
+        try:
+            with open(manifest, "r", encoding="utf-8") as f:
+                return Response(f.read(), mimetype="application/json")
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    # no update published yet
+    return jsonify({"version": "0", "build": "0", "notes": "",
+                    "files": []})
+
+
+@app.route("/update/files/<path:fname>", methods=["GET"])
+def update_file(fname):
+    """Serve one update file (a .py the app will download). Only files inside
+    the updates/ folder can be served (no path traversal)."""
+    # security: no directory traversal, only simple filenames
+    safe = os.path.basename(fname)
+    if safe != fname or safe.startswith("."):
+        return Response("Bad name", status=400)
+    path = os.path.join(UPDATE_DIR, safe)
+    if not os.path.exists(path):
+        return Response("Not found", status=404)
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        return Response(data, mimetype="application/octet-stream")
+    except Exception as e:
+        return Response(str(e), status=500)
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
